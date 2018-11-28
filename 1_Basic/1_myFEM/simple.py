@@ -4,6 +4,8 @@ from myngspy import *
 
 mesh = Mesh(unit_square.GenerateMesh(maxh=0.2))
 
+Draw(mesh)
+
 fes = MyFESpace(mesh, dirichlet="top|bottom|right|left")
 # fes = FESpace("myfespace", mesh, dirichlet="top|bottom|right|left", flags={"secondorder":True})
 print ("freedofs: ", fes.FreeDofs())
@@ -22,9 +24,15 @@ f += MySource(x*y)
 a.Assemble()
 f.Assemble()
 
-u = GridFunction(fes)
+#help(gfu.vec)
+for i in range(0, 283, 7):
+    gfu = GridFunction(fes)
+    gfu.vec[:] = 0
+    gfu.vec[i] = 1
+    Draw(gfu, mesh, f"basis_{i}")
 
+gfu = GridFunction(fes)
 print ("solve")
-u.vec.data = a.mat.Inverse(fes.FreeDofs()) * f.vec
+gfu.vec.data = a.mat.Inverse(fes.FreeDofs()) * f.vec
 
-Draw(u)
+Draw(gfu, mesh, "solution")
