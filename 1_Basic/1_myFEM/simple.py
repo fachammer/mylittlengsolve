@@ -6,7 +6,7 @@ mesh = Mesh(unit_square.GenerateMesh(maxh=0.2))
 
 Draw(mesh)
 
-fes = MyFESpace(mesh, dirichlet="top|bottom|right|left")
+fes = MyFESpace(mesh, dirichlet="top|bottom|right|left", order=3)
 # fes = FESpace("myfespace", mesh, dirichlet="top|bottom|right|left", flags={"secondorder":True})
 print ("freedofs: ", fes.FreeDofs())
 
@@ -24,8 +24,7 @@ f += MySource(x*y)
 a.Assemble()
 f.Assemble()
 
-#help(gfu.vec)
-for i in range(0, 283, 7):
+for i in range(0, len(f.vec.data), 7):
     gfu = GridFunction(fes)
     gfu.vec[:] = 0
     gfu.vec[i] = 1

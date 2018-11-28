@@ -29,12 +29,9 @@ MyFESpace ::MyFESpace(shared_ptr<MeshAccess> ama, const Flags &flags)
   cout << "Constructor of MyFESpace" << endl;
   cout << "Flags = " << flags << endl;
 
-  secondorder = flags.GetDefineFlag("secondorder");
+  order = flags.GetNumFlag("order", 1);
 
-  if (!secondorder)
-    cout << "You have chosen third order elements" << endl;
-  else
-    cout << "You have chosen second order elements" << endl;
+  cout << "You have chosen element order " << order << endl;
 
   // needed for symbolic integrators and to draw solution
   evaluator[VOL] = make_shared<T_DifferentialOperator<DiffOpId<2>>>();
@@ -49,8 +46,8 @@ MyFESpace ::MyFESpace(shared_ptr<MeshAccess> ama, const Flags &flags)
 DocInfo MyFESpace ::GetDocu()
 {
   auto docu = FESpace::GetDocu();
-  docu.Arg("secondorder") = "bool = False\n"
-                            "  Use second order basis functions";
+  docu.Arg("order") = "int = 1\n"
+                      "order of basis functions";
   return docu;
 }
 
@@ -65,32 +62,52 @@ void MyFESpace ::Update(LocalHeap &lh)
 
   // number of dofs:
   ndof = nvert;
-  if (secondorder)
-    ndof += ma->GetNEdges(); // num vertics + num edges
-  else
-    ndof = ma->GetNV() + ma->GetNEdges() * 2 + ma->GetNE();
+  switch (order)
+  {
+  case 1:
+    ndof = ma->GetNV();
+    break;
+  case 2:
+    ndof = ma->GetNV() + ma->GetNEdges();
+    break;
+  case 3:
+    ndof = ma->GetNV() + 2 * ma->GetNEdges() + ma->GetNE();
+    break;
+  }
 }
 
 void MyFESpace ::GetDofNrs(ElementId ei, Array<DofId> &dnums) const
 {
   // returns dofs of element ei
   // may be a volume triangle or boundary segment
-
   dnums.SetSize(0);
 
-  // first dofs are vertex numbers:
-  for (auto v : ma->GetElVertices(ei))
-    dnums.Append(v);
+  auto element = ma->GetElement(ei);
 
-  if (secondorder)
+  switch (order)
   {
-    // more dofs on edges:
-    for (auto e : ma->GetElEdges(ei))
-      dnums.Append(nvert + e);
-  }
-  else
-  {
-    auto element = ma->GetElement(ei);
+  case 1:
+    for (auto vertex : element.Vertices())
+    {
+      dnums.Append(vertex);
+    }
+    break;
+  case 2:
+    for (auto vertex : element.Vertices())
+    {
+      dnums.Append(vertex);
+    }
+    for (auto edge : element.Edges())
+    {
+      dnums.Append(ma->GetNV() + edge);
+    }
+    break;
+  case 3:
+    for (auto vertex : element.Vertices())
+    {
+      dnums.Append(vertex);
+    }
+
     Array<int> edgeElements;
     for (auto edge : element.Edges())
     {
@@ -106,7 +123,12 @@ void MyFESpace ::GetDofNrs(ElementId ei, Array<DofId> &dnums) const
         dnums.Append(ma->GetNV() + 2 * edge);
       }
     }
-    dnums.Append(ma->GetNV() + ma->GetNEdges() * 2 + ei.Nr());
+
+    if (ei.IsVolume())
+    {
+      dnums.Append(ma->GetNV() + ma->GetNEdges() * 2 + ei.Nr());
+    }
+    break;
   }
 }
 
@@ -114,23 +136,37 @@ FiniteElement &MyFESpace ::GetFE(ElementId ei, Allocator &alloc) const
 {
   if (ei.IsVolume())
   {
-    if (!secondorder)
+    switch (order)
     {
-      if (ma->GetElVertices(ei).Size() == 4)
+    case 1:
+      switch (ma->GetElVertices(ei).Size())
+      {
+      case 3:
+        return *new (alloc) MyLinearTrig;
+      case 4:
         return *new (alloc) BilinearQuadElement;
-      else
-        return *new (alloc) ThirdOrderTriangleElement();
-    }
-    else
+      }
+      break;
+    case 2:
       return *new (alloc) MyQuadraticTrig;
+    case 3:
+      return *new (alloc) ThirdOrderTriangleElement;
+    }
   }
   else
   {
-    if (!secondorder)
+    switch (order)
+    {
+    case 1:
       return *new (alloc) FE_Segm1;
-    else
+    case 2:
       return *new (alloc) FE_Segm2;
+    case 3:
+      return *new (alloc) ThirdOrderLineSegment;
+    }
   }
+
+  throw "could not determine a finite element";
 }
 
 /*

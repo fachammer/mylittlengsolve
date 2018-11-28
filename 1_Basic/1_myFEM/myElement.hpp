@@ -78,7 +78,7 @@ public:
   using ScalarFiniteElement<2>::CalcDShape;
 };
 
-class ThirdOrderTriangleElement : public ScalarFiniteElement<2>, public VertexOrientedFE<ET_TRIG>
+class ThirdOrderTriangleElement : public ScalarFiniteElement<2>
 {
   public:
   ThirdOrderTriangleElement();
@@ -88,6 +88,18 @@ class ThirdOrderTriangleElement : public ScalarFiniteElement<2>, public VertexOr
 
   using ScalarFiniteElement<2>::CalcShape;
   using ScalarFiniteElement<2>::CalcDShape;
+};
+
+class ThirdOrderLineSegment : public ScalarFiniteElement<1>
+{
+  public:
+    ThirdOrderLineSegment();
+    virtual ELEMENT_TYPE ElementType() const { return ET_SEGM; }
+    virtual void CalcShape(const IntegrationPoint &ip, BareSliceVector<> shape) const;
+    virtual void CalcDShape(const IntegrationPoint &ip, BareSliceMatrix<> dshape) const;
+
+    using ScalarFiniteElement<1>::CalcShape;
+    using ScalarFiniteElement<1>::CalcDShape;
 };
 
 } // namespace ngfem

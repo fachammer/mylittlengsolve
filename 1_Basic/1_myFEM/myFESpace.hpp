@@ -21,7 +21,7 @@ namespace ngcomp
 
   class MyFESpace : public FESpace
   {
-    bool secondorder;
+    int order;
     int ndof, nvert;
     
   public:

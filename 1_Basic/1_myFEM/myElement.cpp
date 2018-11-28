@@ -167,18 +167,47 @@ std::array<AutoDiff<2>, 10> GetThirdOrderTriangleBasisFunctions(const Integratio
 void ThirdOrderTriangleElement::CalcShape(const IntegrationPoint &ip, BareSliceVector<> shape) const
 {
   auto basis = GetThirdOrderTriangleBasisFunctions(ip);
-  for(int i = 0; i < 10; i++)
+  for(int i = 0; i < ndof; i++)
     shape(i) = basis[i].Value();
 }
 
 void ThirdOrderTriangleElement::CalcDShape(const IntegrationPoint &ip, BareSliceMatrix<> dshape) const
 {
   auto basis = GetThirdOrderTriangleBasisFunctions(ip);
-  for(int i = 0; i < 10; i++)
+  for(int i = 0; i < ndof; i++)
   {
     dshape(i, 0) = basis[i].DValue(0);
     dshape(i, 1) = basis[i].DValue(1);
   }
+}
+
+ThirdOrderLineSegment::ThirdOrderLineSegment() : ScalarFiniteElement<1>(4, 3) {
+
+}
+
+std::array<AutoDiff<2>, 4> GetThirdOrderLineSegmentBasisFunctions(const IntegrationPoint &ip) {
+  AutoDiff<2> x(ip(0), 0);
+
+  return {
+    -(9.0/2) * (x - 1.0/3) * (x - 2.0/3) * (x - 1.0),
+    (9.0/2) * x * (x - 1.0/3) * (x - 2.0/3),
+    (27.0/2) * x * (x - 2.0/3) * (x - 1.0),
+    -(27.0/2) * x * (x - 1.0/3) * (x - 1.0)
+  };
+}
+
+void ThirdOrderLineSegment::CalcShape(const IntegrationPoint &ip, BareSliceVector<> shape) const
+{
+  auto basis = GetThirdOrderLineSegmentBasisFunctions(ip);
+  for(int i = 0; i < ndof; i++)
+    shape(i) = basis[i].Value();
+}
+
+void ThirdOrderLineSegment::CalcDShape(const IntegrationPoint &ip, BareSliceMatrix<> dshape) const
+{
+  auto basis = GetThirdOrderLineSegmentBasisFunctions(ip);
+  for(int i = 0; i < ndof; i++)
+    dshape(i, 0) = basis[i].DValue(0);
 }
 
 } // namespace ngfem
