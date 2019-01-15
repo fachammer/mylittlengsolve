@@ -9,302 +9,272 @@
 
 */
 
-
-
 #include <solve.hpp>
 #include <python_ngstd.hpp>
 
-
 using namespace ngsolve;
 using ngfem::ELEMENT_TYPE;
-
-
 
 template <int D>
 class Convection
 {
 protected:
-  shared_ptr<L2HighOrderFESpace> fes;
-  shared_ptr<CoefficientFunction> cfflow;
+  shared_ptr<L2HighOrderFESpace> finiteElementSpace;
+  shared_ptr<CoefficientFunction> flowCoefficientFunction;
 
   class FacetData
   {
   public:
-    size_t elnr[2];
-    int facetnr[2];
-    Vector<> flown;
+    size_t adjacentElementNumbers[2];
+    int elementLocalFacetNumber[2];
+    Vector<> InnerProductOfFlowWithNormalVectorAtIntegrationPoint;
     FacetData() = default;
-    FacetData (size_t nip) : flown(nip) { ; }
+    FacetData(size_t numberOfIntegrationPoints) : InnerProductOfFlowWithNormalVectorAtIntegrationPoint(numberOfIntegrationPoints) { ; }
   };
-
 
   class ElementData
   {
   public:
-    MatrixFixWidth<D> flowip;
+    MatrixFixWidth<D> flowAtIntegrationPoint;
     ElementData() = default;
-    ElementData (size_t ndof, size_t nip) : flowip(nip) { ; }
+    ElementData(size_t ndof, size_t numberOfIntegrationPoints) : flowAtIntegrationPoint(numberOfIntegrationPoints) { ; }
   };
 
-  Array<FacetData> facetdata;         // new move semantics
-  Array<ElementData> elementdata;     // new move semantics
+  Array<FacetData> facetsData;     // new move semantics
+  Array<ElementData> elementsData; // new move semantics
 
 public:
-    
-  Convection (shared_ptr<FESpace> afes, shared_ptr<CoefficientFunction> aflow)
-    : fes(dynamic_pointer_cast<L2HighOrderFESpace>(afes)), cfflow(aflow)
+  Convection(shared_ptr<FESpace> finiteElementSpace, shared_ptr<CoefficientFunction> aflow)
+      : finiteElementSpace(dynamic_pointer_cast<L2HighOrderFESpace>(finiteElementSpace)), flowCoefficientFunction(aflow)
   {
-    LocalHeap lh(1000000);
-    shared_ptr<MeshAccess> ma = fes->GetMeshAccess();
-    elementdata.SetAllocSize (ma->GetNE());
+    LocalHeap localHeap(1000000);
+    shared_ptr<MeshAccess> meshAccess = this->finiteElementSpace->GetMeshAccess();
+    elementsData.SetAllocSize(meshAccess->GetNE());
 
-    if (!fes->AllDofsTogether())
+    if (!this->finiteElementSpace->AllDofsTogether())
       throw Exception("mlngs-Convection needs 'all_dofs_together=True' for L2-FESpace");
-    
-    for (auto ei : ma->Elements())
+
+    for (auto elementId : meshAccess->Elements())
+    {
+      HeapReset heapReset(localHeap);
+
+      auto &finiteElement = dynamic_cast<const DGFiniteElement<D> &>(this->finiteElementSpace->GetFE(elementId, localHeap));
+      const IntegrationRule integrationRule(finiteElement.ElementType(), 2 * finiteElement.Order());
+
+      const_cast<DGFiniteElement<D> &>(finiteElement).PrecomputeShapes(integrationRule);
+      const_cast<DGFiniteElement<D> &>(finiteElement).PrecomputeTrace();
+
+      auto &elementTransform = meshAccess->GetTrafo(elementId, localHeap);
+      MappedIntegrationRule<D, D> mappedIntegrationRule(integrationRule, elementTransform, localHeap);
+
+      ElementData elementData(finiteElement.GetNDof(), integrationRule.Size());
+      flowCoefficientFunction->Evaluate(mappedIntegrationRule, elementData.flowAtIntegrationPoint);
+      for (size_t j = 0; j < integrationRule.Size(); j++)
       {
-	HeapReset hr(lh);
-	
-	auto & fel = dynamic_cast<const DGFiniteElement<D>&> (fes->GetFE (ei, lh));
-	const IntegrationRule ir(fel.ElementType(), 2*fel.Order());
-
-        const_cast<DGFiniteElement<D>&> (fel).PrecomputeShapes (ir);
-        const_cast<DGFiniteElement<D>&> (fel).PrecomputeTrace ();
-
-        auto & trafo = ma->GetTrafo(ei, lh);
-	MappedIntegrationRule<D,D> mir(ir, trafo, lh);
-	
-	ElementData edi(fel.GetNDof(), ir.Size());
-        cfflow -> Evaluate (mir, edi.flowip);
-	for (size_t j = 0; j < ir.Size(); j++)
-	  {
-	    Vec<D> flow = mir[j].GetJacobianInverse() * edi.flowip.Row(j);
-            flow *= mir[j].GetWeight();	 // weight times Jacobian	
-	    edi.flowip.Row(j) = flow;
-	  }
-
-        elementdata.Append (move(edi));
+        Vec<D> flow = mappedIntegrationRule[j].GetJacobianInverse() * elementData.flowAtIntegrationPoint.Row(j);
+        flow *= mappedIntegrationRule[j].GetWeight(); // weight times Jacobian
+        elementData.flowAtIntegrationPoint.Row(j) = flow;
       }
 
+      elementsData.Append(move(elementData));
+    }
 
-    Array<int> elnums, fnums, vnums;
-    
-    facetdata.SetAllocSize (ma->GetNFacets());
+    Array<int> facetElementNumbers, facetNumbers, vertexNumbers;
 
-    for (auto i : Range(ma->GetNFacets()))
+    facetsData.SetAllocSize(meshAccess->GetNFacets());
+
+    for (auto i : Range(meshAccess->GetNFacets()))
+    {
+      HeapReset heapReset(localHeap);
+
+      const DGFiniteElement<D - 1> &finiteElementFacet =
+          dynamic_cast<const DGFiniteElement<D - 1> &>(this->finiteElementSpace->GetFacetFE(i, localHeap));
+      IntegrationRule facetIntegrationRule(finiteElementFacet.ElementType(), 2 * finiteElementFacet.Order());
+      const_cast<DGFiniteElement<D - 1> &>(finiteElementFacet).PrecomputeShapes(facetIntegrationRule);
+
+      FacetData facetData(facetIntegrationRule.Size());
+
+      meshAccess->GetFacetElements(i, facetElementNumbers);
+
+      facetData.adjacentElementNumbers[1] = -1;
+      for (size_t j : Range(facetElementNumbers))
       {
-	HeapReset hr(lh);
-	
-	const DGFiniteElement<D-1> & felfacet = 
-	  dynamic_cast<const DGFiniteElement<D-1>&> (fes->GetFacetFE (i, lh));
-	IntegrationRule ir (felfacet.ElementType(), 2*felfacet.Order());
-        const_cast<DGFiniteElement<D-1>&> (felfacet).PrecomputeShapes (ir);
-
-
-        FacetData fai(ir.Size());
-
-	ma->GetFacetElements (i, elnums);
-
-	fai.elnr[1] = -1;
-	for (size_t j : Range(elnums))
-	  {
-	    fai.elnr[j] = elnums[j];
-	    auto fnums = ma->GetElFacets (ElementId(VOL,elnums[j]));
-            fai.facetnr[j] = fnums.Pos(i);
-	  }
-
-	
-	ELEMENT_TYPE eltype = ma->GetElType(ElementId(VOL,elnums[0]));
-
-	vnums = ma->GetElVertices (ElementId(VOL,elnums[0]));
-	Facet2ElementTrafo transform(eltype, vnums); 
-	FlatVec<D> normal_ref = ElementTopology::GetNormals(eltype) [fai.facetnr[0]];
-	
-	size_t nip = ir.Size();
-	
-	// transform facet coordinates to element coordinates
-	IntegrationRule & irt = transform(fai.facetnr[0], ir, lh);  
-	MappedIntegrationRule<D,D> mir(irt, ma->GetTrafo(ElementId(VOL, elnums[0]), lh), lh);
-	
-	FlatMatrixFixWidth<D> flowir(nip, lh);
-	cfflow -> Evaluate (mir, flowir);
-	
-	for (size_t j = 0; j < nip; j++)
-	  {
-	    Vec<D> normal = Trans (mir[j].GetJacobianInverse()) * normal_ref;       
-	    
-	    fai.flown(j) = InnerProduct (normal, flowir.Row(j));
-	    fai.flown(j) *= ir[j].Weight() * mir[j].GetJacobiDet();
-	  }
-
-	facetdata.Append (move(fai));
+        facetData.adjacentElementNumbers[j] = facetElementNumbers[j];
+        auto facetNumbers = meshAccess->GetElFacets(ElementId(VOL, facetElementNumbers[j]));
+        facetData.elementLocalFacetNumber[j] = facetNumbers.Pos(i);
       }
+
+      ELEMENT_TYPE elementType = meshAccess->GetElType(ElementId(VOL, facetElementNumbers[0]));
+
+      vertexNumbers = meshAccess->GetElVertices(ElementId(VOL, facetElementNumbers[0]));
+      Facet2ElementTrafo transform(elementType, vertexNumbers);
+      FlatVec<D> referenceNormal = ElementTopology::GetNormals(elementType)[facetData.elementLocalFacetNumber[0]];
+
+      size_t numberOfIntegrationPoints = facetIntegrationRule.Size();
+
+      // transform facet coordinates to element coordinates
+      IntegrationRule &elementIntegrationRule = transform(facetData.elementLocalFacetNumber[0], facetIntegrationRule, localHeap);
+      MappedIntegrationRule<D, D> mappedElementIntegrationRule(elementIntegrationRule, meshAccess->GetTrafo(ElementId(VOL, facetElementNumbers[0]), localHeap), localHeap);
+
+      FlatMatrixFixWidth<D> flowAtMappedElementIntegrationPoints(numberOfIntegrationPoints, localHeap);
+      flowCoefficientFunction->Evaluate(mappedElementIntegrationRule, flowAtMappedElementIntegrationPoints);
+
+      for (size_t j = 0; j < numberOfIntegrationPoints; j++)
+      {
+        Vec<D> normal = Trans(mappedElementIntegrationRule[j].GetJacobianInverse()) * referenceNormal;
+
+        facetData.InnerProductOfFlowWithNormalVectorAtIntegrationPoint(j) = InnerProduct(normal, flowAtMappedElementIntegrationPoints.Row(j));
+        facetData.InnerProductOfFlowWithNormalVectorAtIntegrationPoint(j) *= facetIntegrationRule[j].Weight() * mappedElementIntegrationRule[j].GetJacobiDet();
+      }
+
+      facetsData.Append(move(facetData));
+    }
   }
 
-
-
-  void Apply (BaseVector & _vecu, BaseVector & _conv)
+  void Apply(BaseVector &_vecu, BaseVector &_conv)
   {
-    static Timer t("Convection::Apply"); RegionTimer reg(t);
-    LocalHeap lh(1000*1000);
+    static Timer timer("Convection::Apply");
+    RegionTimer reg(timer);
+    LocalHeap localHeap(1000 * 1000);
 
-    auto vecu = _vecu.FV<double>();
-    auto conv = _conv.FV<double>();
-    
-    auto ma = fes->GetMeshAccess();
-    
-    ParallelFor
-      (Range(ma->GetNE()), [&] (size_t i)
-       {
-         LocalHeap slh = lh.Split(), &lh = slh;
-	 
-         auto & fel = static_cast<const ScalarFiniteElement<D>&> (fes->GetFE (ElementId(VOL,i), lh));
-         const IntegrationRule ir(fel.ElementType(), 2*fel.Order());
-         
-         FlatMatrixFixWidth<D> flowip = elementdata[i].flowip;
-         
-         /*
+    auto concentration = _vecu.FV<double>();
+    auto convection = _conv.FV<double>();
+
+    auto meshAccess = this->finiteElementSpace->GetMeshAccess();
+
+    ParallelFor(Range(meshAccess->GetNE()), [&](size_t i) {
+      LocalHeap threadLocalHeap = localHeap.Split(), &localHeap = threadLocalHeap;
+
+      auto &finiteElement = static_cast<const ScalarFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, i), localHeap));
+      const IntegrationRule integrationRule(finiteElement.ElementType(), 2 * finiteElement.Order());
+
+      FlatMatrixFixWidth<D> flowAtIntegrationPoint = elementsData[i].flowAtIntegrationPoint;
+
+      /*
          // use this for time-dependent flow (updated version not yet tested)
-         MappedIntegrationRule<D,D> mir(ir, ma->GetTrafo (i, 0, lh), lh);
-         FlatMatrixFixWidth<D> flowip(mir.Size(), lh);
-         cfflow -> Evaluate (mir, flowip);
-         for (size_t j = 0; j < ir.Size(); j++)
+         MappedIntegrationRule<D,D> mappedIntegrationRule(integrationRule, meshAccess->GetTrafo (i, 0, localHeap), localHeap);
+         FlatMatrixFixWidth<D> flowAtIntegrationPoint(mappedIntegrationRule.Size(), localHeap);
+         flowCoefficientFunction -> Evaluate (mappedIntegrationRule, flowAtIntegrationPoint);
+         for (size_t j = 0; j < integrationRule.Size(); j++)
          {
-         Vec<D> flow = mir[j].GetJacobianInverse() * flowip.Row(j);
-         flow *= mir[j].GetWeight();		
-         flowip.Row(j) = flow;
+         Vec<D> flow = mappedIntegrationRule[j].GetJacobianInverse() * flowAtIntegrationPoint.Row(j);
+         flow *= mappedIntegrationRule[j].GetWeight();		
+         flowAtIntegrationPoint.Row(j) = flow;
          }
          */
 
-         IntRange dn = fes->GetElementDofs (i);
-	 
-         size_t nipt = ir.Size();
-         FlatVector<> elui(nipt, lh);
-         FlatMatrixFixWidth<D> flowui (nipt, lh);
+      IntRange elementDofs = this->finiteElementSpace->GetElementDofs(i);
 
-         fel.Evaluate (ir, vecu.Range (dn), elui);
+      size_t numberOfIntegrationPoints = integrationRule.Size();
+      FlatVector<> concentrationAtElementIntegrationPoints(numberOfIntegrationPoints, localHeap);
+      FlatMatrixFixWidth<D> flowTimesConcentrationAtElementIntegrationPoints(numberOfIntegrationPoints, localHeap);
 
-         for (auto k : Range(nipt))
-           flowui.Row(k) = elui(k) * flowip.Row(k);
+      finiteElement.Evaluate(integrationRule, concentration.Range(elementDofs), concentrationAtElementIntegrationPoints);
 
-         fel.EvaluateGradTrans (ir, flowui, conv.Range(dn));
-       });
+      for (auto k : Range(numberOfIntegrationPoints))
+        flowTimesConcentrationAtElementIntegrationPoints.Row(k) = concentrationAtElementIntegrationPoints(k) * flowAtIntegrationPoint.Row(k);
+
+      finiteElement.EvaluateGradTrans(integrationRule, flowTimesConcentrationAtElementIntegrationPoints, convection.Range(elementDofs));
+    });
 
     static mutex add_mutex;
 
-    ParallelFor 
-      (Range(ma->GetNFacets()), [&] (size_t i)
-       {
-         LocalHeap slh = lh.Split(), &lh = slh;
-           
-         const FacetData & fai = facetdata[i];
-         if (fai.elnr[1] != -1)
-           {
-             // internal facet
-             const DGFiniteElement<D> & fel1 = 
-               static_cast<const DGFiniteElement<D>&> (fes->GetFE (ElementId(VOL,fai.elnr[0]), lh));
-             const DGFiniteElement<D> & fel2 = 
-               static_cast<const DGFiniteElement<D>&> (fes->GetFE (ElementId(VOL,fai.elnr[1]), lh));
-             const DGFiniteElement<D-1> & felfacet = 
-               static_cast<const DGFiniteElement<D-1>&> (fes->GetFacetFE (i, lh));
+    ParallelFor(Range(meshAccess->GetNFacets()), [&](size_t i) {
+      // TODO: check whether it's possible to just use threadLocalHeap and remove localHeap reference inside this loop
+      LocalHeap threadLocalHeap = localHeap.Split(), &localHeap = threadLocalHeap;
 
-             IntRange dn1 = fes->GetElementDofs (fai.elnr[0]);
-             IntRange dn2 = fes->GetElementDofs (fai.elnr[1]);
+      const FacetData &facetData = facetsData[i];
+      if (facetData.adjacentElementNumbers[1] != -1)
+      {
+        // internal facet
+        const DGFiniteElement<D> &finiteElement1 =
+            static_cast<const DGFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, facetData.adjacentElementNumbers[0]), localHeap));
+        const DGFiniteElement<D> &finiteElement2 =
+            static_cast<const DGFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, facetData.adjacentElementNumbers[1]), localHeap));
+        const DGFiniteElement<D - 1> &finiteElementFacet =
+            static_cast<const DGFiniteElement<D - 1> &>(this->finiteElementSpace->GetFacetFE(i, localHeap));
 
-             size_t ndoffacet = felfacet.GetNDof();
-             size_t ndof1 = fel1.GetNDof();
-             size_t ndof2 = fel2.GetNDof();
+        IntRange dofNumbers1 = this->finiteElementSpace->GetElementDofs(facetData.adjacentElementNumbers[0]);
+        IntRange dofNumbers2 = this->finiteElementSpace->GetElementDofs(facetData.adjacentElementNumbers[1]);
 
-             FlatVector<> aelu1(ndof1, lh), aelu2(ndof2, lh);
-             FlatVector<> trace1(ndoffacet, lh), trace2(ndoffacet, lh);
+        size_t numberOfFacetDofs = finiteElementFacet.GetNDof();
+        size_t numberOfElementDofs = finiteElement1.GetNDof();
+        size_t numberOfDofsIn2 = finiteElement2.GetNDof();
 
-             fel1.GetTrace (fai.facetnr[0], vecu.Range (dn1), trace1);
-             fel2.GetTrace (fai.facetnr[1], vecu.Range (dn2), trace2);
+        FlatVector<> convectionCoefficients1(numberOfElementDofs, localHeap), convectionCoefficients2(numberOfDofsIn2, localHeap);
+        FlatVector<> traceCoefficients1(numberOfFacetDofs, localHeap), traceCoefficients2(numberOfFacetDofs, localHeap);
 
-             IntegrationRule ir(felfacet.ElementType(), 2*felfacet.Order());
-             size_t nip = ir.Size();
+        finiteElement1.GetTrace(facetData.elementLocalFacetNumber[0], concentration.Range(dofNumbers1), traceCoefficients1);
+        finiteElement2.GetTrace(facetData.elementLocalFacetNumber[1], concentration.Range(dofNumbers2), traceCoefficients2);
 
-             FlatVector<> flown = fai.flown;
-	    
-             FlatVector<> tracei1(nip, lh), tracei2(nip, lh);
-             FlatVector<> tracei(nip, lh);
+        IntegrationRule facetIntegrationRule(finiteElementFacet.ElementType(), 2 * finiteElementFacet.Order());
+        size_t numberOfIntegrationPoints = facetIntegrationRule.Size();
 
-             felfacet.Evaluate (ir, trace1, tracei1);
-             felfacet.Evaluate (ir, trace2, tracei2);
-		    
-             for (size_t j = 0; j < nip; j++)
-               tracei(j) = flown(j) * ( (flown(j) > 0) ? tracei1(j) : tracei2(j) );
+        FlatVector<> InnerProductOfFlowWithNormalVectorAtIntegrationPoint = facetData.InnerProductOfFlowWithNormalVectorAtIntegrationPoint;
 
-             felfacet.EvaluateTrans (ir, tracei, trace1);
-             fel1.GetTraceTrans (fai.facetnr[0], trace1, aelu1);
-             fel2.GetTraceTrans (fai.facetnr[1], trace1, aelu2);
+        FlatVector<> traceAtIntegrationPoints1(numberOfIntegrationPoints, localHeap), traceAtIntegrationPoints2(numberOfIntegrationPoints, localHeap);
+        FlatVector<> upwindTraceAtIntegrationPoints(numberOfIntegrationPoints, localHeap);
 
-             {
-               lock_guard<mutex> guard(add_mutex);
-               conv.Range (dn1) -= aelu1;
-               conv.Range (dn2) += aelu2;
-             }
-           }
-         else
-           {
-             // boundary facet
-             const DGFiniteElement<D> & fel1 = 
-               dynamic_cast<const DGFiniteElement<D>&> (fes->GetFE (ElementId(VOL,fai.elnr[0]), lh));
-             const DGFiniteElement<D-1> & felfacet = 
-               dynamic_cast<const DGFiniteElement<D-1>&> (fes->GetFacetFE (i, lh));
+        finiteElementFacet.Evaluate(facetIntegrationRule, traceCoefficients1, traceAtIntegrationPoints1);
+        finiteElementFacet.Evaluate(facetIntegrationRule, traceCoefficients2, traceAtIntegrationPoints2);
 
-             IntRange dn1 = fes->GetElementDofs (fai.elnr[0]);
+        for (size_t j = 0; j < numberOfIntegrationPoints; j++)
+          upwindTraceAtIntegrationPoints(j) = InnerProductOfFlowWithNormalVectorAtIntegrationPoint(j) * ((InnerProductOfFlowWithNormalVectorAtIntegrationPoint(j) > 0) ? traceAtIntegrationPoints1(j) : traceAtIntegrationPoints2(j));
 
-             size_t ndoffacet = felfacet.GetNDof();
-             size_t ndof1 = fel1.GetNDof();
+        finiteElementFacet.EvaluateTrans(facetIntegrationRule, upwindTraceAtIntegrationPoints, traceCoefficients1);
+        finiteElement1.GetTraceTrans(facetData.elementLocalFacetNumber[0], traceCoefficients1, convectionCoefficients1);
+        finiteElement2.GetTraceTrans(facetData.elementLocalFacetNumber[1], traceCoefficients1, convectionCoefficients2);
 
-             FlatVector<> elu1(ndof1, lh);
-             FlatVector<> trace1(ndoffacet, lh);
+        {
+          lock_guard<mutex> guard(add_mutex);
+          convection.Range(dofNumbers1) -= convectionCoefficients1;
+          convection.Range(dofNumbers2) += convectionCoefficients2;
+        }
+      }
+      else
+      {
+        // boundary facet
+        const DGFiniteElement<D> &finiteElement =
+            dynamic_cast<const DGFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, facetData.adjacentElementNumbers[0]), localHeap));
+        const DGFiniteElement<D - 1> &finiteElementFacet =
+            dynamic_cast<const DGFiniteElement<D - 1> &>(this->finiteElementSpace->GetFacetFE(i, localHeap));
 
-             fel1.GetTrace (fai.facetnr[0], vecu.Range (dn1), trace1);
+        IntRange dofNumbers = this->finiteElementSpace->GetElementDofs(facetData.adjacentElementNumbers[0]);
 
-             IntegrationRule ir(felfacet.ElementType(), 2*felfacet.Order());
-             size_t nip = ir.Size();
+        size_t numberOfFacetDofs = finiteElementFacet.GetNDof();
+        size_t numberOfElementDofs = finiteElement.GetNDof();
 
-             FlatVector<> flown = fai.flown; 
-             FlatVector<> tracei1(nip, lh), tracei(nip, lh);
+        FlatVector<> convectionCoefficients(numberOfElementDofs, localHeap);
+        FlatVector<> traceCoefficients(numberOfFacetDofs, localHeap);
 
-             felfacet.Evaluate (ir, trace1, tracei1);
-		    
-             for (size_t j = 0; j < nip; j++)
-               tracei(j) = flown(j) * ( (flown(j) > 0) ? tracei1(j) : 0 );
+        finiteElement.GetTrace(facetData.elementLocalFacetNumber[0], concentration.Range(dofNumbers), traceCoefficients);
 
-             felfacet.EvaluateTrans (ir, tracei, trace1);
-             fel1.GetTraceTrans (fai.facetnr[0], trace1, elu1);
-	    
-             {
-               lock_guard<mutex> guard(add_mutex);               
-               conv.Range (dn1) -= elu1;
-             }
-           }
-       });
+        IntegrationRule facetIntegrationRule(finiteElementFacet.ElementType(), 2 * finiteElementFacet.Order());
+        size_t numberOfIntegrationPoints = facetIntegrationRule.Size();
+
+        FlatVector<> InnerProductOfFlowWithNormalVectorAtIntegrationPoint = facetData.InnerProductOfFlowWithNormalVectorAtIntegrationPoint;
+        FlatVector<> traceAtIntegrationPoints(numberOfIntegrationPoints, localHeap), upwindTraceAtIntegrationPoints(numberOfIntegrationPoints, localHeap);
+
+        finiteElementFacet.Evaluate(facetIntegrationRule, traceCoefficients, traceAtIntegrationPoints);
+
+        for (size_t j = 0; j < numberOfIntegrationPoints; j++)
+          upwindTraceAtIntegrationPoints(j) = InnerProductOfFlowWithNormalVectorAtIntegrationPoint(j) * ((InnerProductOfFlowWithNormalVectorAtIntegrationPoint(j) > 0) ? traceAtIntegrationPoints(j) : 0);
+
+        finiteElementFacet.EvaluateTrans(facetIntegrationRule, upwindTraceAtIntegrationPoints, traceCoefficients);
+        finiteElement.GetTraceTrans(facetData.elementLocalFacetNumber[0], traceCoefficients, convectionCoefficients);
+
+        {
+          lock_guard<mutex> guard(add_mutex);
+          convection.Range(dofNumbers) -= convectionCoefficients;
+        }
+      }
+    });
   }
 };
 
-
-
-
-PYBIND11_MODULE(liblinhyp, m) {
-
-  py::class_<Convection<2>> (m, "Convection")
-    .def(py::init<shared_ptr<FESpace>, shared_ptr<CoefficientFunction>>())
-    .def("Apply", &Convection<2>::Apply)
-    ;
+PYBIND11_MODULE(liblinhyp, m)
+{
+  py::class_<Convection<2>>(m, "Convection")
+      .def(py::init<shared_ptr<FESpace>, shared_ptr<CoefficientFunction>>())
+      .def("Apply", &Convection<2>::Apply);
 }
-
-  
-
-
-
-
-
-
-
-
-
-
