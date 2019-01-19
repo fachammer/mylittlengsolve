@@ -143,17 +143,17 @@ public:
     auto meshAccess = this->finiteElementSpace->GetMeshAccess();
 
     ParallelFor(Range(meshAccess->GetNE()), [&](size_t i) {
-      LocalHeap threadLocalHeap = localHeap.Split(), &localHeap = threadLocalHeap;
+      LocalHeap threadLocalHeap = localHeap.Split();
 
-      auto &finiteElement = static_cast<const ScalarFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, i), localHeap));
+      auto &finiteElement = static_cast<const ScalarFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, i), threadLocalHeap));
       const IntegrationRule integrationRule(finiteElement.ElementType(), 2 * finiteElement.Order());
 
       FlatMatrixFixWidth<D> flowAtIntegrationPoint = elementsData[i].flowAtIntegrationPoint;
 
       /*
          // use this for time-dependent flow (updated version not yet tested)
-         MappedIntegrationRule<D,D> mappedIntegrationRule(integrationRule, meshAccess->GetTrafo (i, 0, localHeap), localHeap);
-         FlatMatrixFixWidth<D> flowAtIntegrationPoint(mappedIntegrationRule.Size(), localHeap);
+         MappedIntegrationRule<D,D> mappedIntegrationRule(integrationRule, meshAccess->GetTrafo (i, 0, threadLocalHeap), threadLocalHeap);
+         FlatMatrixFixWidth<D> flowAtIntegrationPoint(mappedIntegrationRule.Size(), threadLocalHeap);
          flowCoefficientFunction -> Evaluate (mappedIntegrationRule, flowAtIntegrationPoint);
          for (size_t j = 0; j < integrationRule.Size(); j++)
          {
@@ -166,8 +166,8 @@ public:
       IntRange elementDofs = this->finiteElementSpace->GetElementDofs(i);
 
       size_t numberOfIntegrationPoints = integrationRule.Size();
-      FlatVector<> concentrationAtElementIntegrationPoints(numberOfIntegrationPoints, localHeap);
-      FlatMatrixFixWidth<D> flowTimesConcentrationAtElementIntegrationPoints(numberOfIntegrationPoints, localHeap);
+      FlatVector<> concentrationAtElementIntegrationPoints(numberOfIntegrationPoints, threadLocalHeap);
+      FlatMatrixFixWidth<D> flowTimesConcentrationAtElementIntegrationPoints(numberOfIntegrationPoints, threadLocalHeap);
 
       finiteElement.Evaluate(integrationRule, concentration.Range(elementDofs), concentrationAtElementIntegrationPoints);
 
@@ -180,29 +180,28 @@ public:
     static mutex add_mutex;
 
     ParallelFor(Range(meshAccess->GetNFacets()), [&](size_t i) {
-      // TODO: check whether it's possible to just use threadLocalHeap and remove localHeap reference inside this loop
-      LocalHeap threadLocalHeap = localHeap.Split(), &localHeap = threadLocalHeap;
+      LocalHeap threadLocalHeap = localHeap.Split();
 
       const FacetData &facetData = facetsData[i];
       if (facetData.adjacentElementNumbers[1] != -1)
       {
         // internal facet
         const DGFiniteElement<D> &finiteElement1 =
-            static_cast<const DGFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, facetData.adjacentElementNumbers[0]), localHeap));
+            static_cast<const DGFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, facetData.adjacentElementNumbers[0]), threadLocalHeap));
         const DGFiniteElement<D> &finiteElement2 =
-            static_cast<const DGFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, facetData.adjacentElementNumbers[1]), localHeap));
+            static_cast<const DGFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, facetData.adjacentElementNumbers[1]), threadLocalHeap));
         const DGFiniteElement<D - 1> &finiteElementFacet =
-            static_cast<const DGFiniteElement<D - 1> &>(this->finiteElementSpace->GetFacetFE(i, localHeap));
+            static_cast<const DGFiniteElement<D - 1> &>(this->finiteElementSpace->GetFacetFE(i, threadLocalHeap));
 
         IntRange dofNumbers1 = this->finiteElementSpace->GetElementDofs(facetData.adjacentElementNumbers[0]);
         IntRange dofNumbers2 = this->finiteElementSpace->GetElementDofs(facetData.adjacentElementNumbers[1]);
 
         size_t numberOfFacetDofs = finiteElementFacet.GetNDof();
-        size_t numberOfElementDofs = finiteElement1.GetNDof();
+        size_t numberOfDofsIn1 = finiteElement1.GetNDof();
         size_t numberOfDofsIn2 = finiteElement2.GetNDof();
 
-        FlatVector<> convectionCoefficients1(numberOfElementDofs, localHeap), convectionCoefficients2(numberOfDofsIn2, localHeap);
-        FlatVector<> traceCoefficients1(numberOfFacetDofs, localHeap), traceCoefficients2(numberOfFacetDofs, localHeap);
+        FlatVector<> convectionCoefficients1(numberOfDofsIn1, threadLocalHeap), convectionCoefficients2(numberOfDofsIn2, threadLocalHeap);
+        FlatVector<> traceCoefficients1(numberOfFacetDofs, threadLocalHeap), traceCoefficients2(numberOfFacetDofs, threadLocalHeap);
 
         finiteElement1.GetTrace(facetData.elementLocalFacetNumber[0], concentration.Range(dofNumbers1), traceCoefficients1);
         finiteElement2.GetTrace(facetData.elementLocalFacetNumber[1], concentration.Range(dofNumbers2), traceCoefficients2);
@@ -212,8 +211,8 @@ public:
 
         FlatVector<> InnerProductOfFlowWithNormalVectorAtIntegrationPoint = facetData.InnerProductOfFlowWithNormalVectorAtIntegrationPoint;
 
-        FlatVector<> traceAtIntegrationPoints1(numberOfIntegrationPoints, localHeap), traceAtIntegrationPoints2(numberOfIntegrationPoints, localHeap);
-        FlatVector<> upwindTraceAtIntegrationPoints(numberOfIntegrationPoints, localHeap);
+        FlatVector<> traceAtIntegrationPoints1(numberOfIntegrationPoints, threadLocalHeap), traceAtIntegrationPoints2(numberOfIntegrationPoints, threadLocalHeap);
+        FlatVector<> upwindTraceAtIntegrationPoints(numberOfIntegrationPoints, threadLocalHeap);
 
         finiteElementFacet.Evaluate(facetIntegrationRule, traceCoefficients1, traceAtIntegrationPoints1);
         finiteElementFacet.Evaluate(facetIntegrationRule, traceCoefficients2, traceAtIntegrationPoints2);
@@ -235,17 +234,17 @@ public:
       {
         // boundary facet
         const DGFiniteElement<D> &finiteElement =
-            dynamic_cast<const DGFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, facetData.adjacentElementNumbers[0]), localHeap));
+            dynamic_cast<const DGFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, facetData.adjacentElementNumbers[0]), threadLocalHeap));
         const DGFiniteElement<D - 1> &finiteElementFacet =
-            dynamic_cast<const DGFiniteElement<D - 1> &>(this->finiteElementSpace->GetFacetFE(i, localHeap));
+            dynamic_cast<const DGFiniteElement<D - 1> &>(this->finiteElementSpace->GetFacetFE(i, threadLocalHeap));
 
         IntRange dofNumbers = this->finiteElementSpace->GetElementDofs(facetData.adjacentElementNumbers[0]);
 
         size_t numberOfFacetDofs = finiteElementFacet.GetNDof();
         size_t numberOfElementDofs = finiteElement.GetNDof();
 
-        FlatVector<> convectionCoefficients(numberOfElementDofs, localHeap);
-        FlatVector<> traceCoefficients(numberOfFacetDofs, localHeap);
+        FlatVector<> convectionCoefficients(numberOfElementDofs, threadLocalHeap);
+        FlatVector<> traceCoefficients(numberOfFacetDofs, threadLocalHeap);
 
         finiteElement.GetTrace(facetData.elementLocalFacetNumber[0], concentration.Range(dofNumbers), traceCoefficients);
 
@@ -253,7 +252,7 @@ public:
         size_t numberOfIntegrationPoints = facetIntegrationRule.Size();
 
         FlatVector<> InnerProductOfFlowWithNormalVectorAtIntegrationPoint = facetData.InnerProductOfFlowWithNormalVectorAtIntegrationPoint;
-        FlatVector<> traceAtIntegrationPoints(numberOfIntegrationPoints, localHeap), upwindTraceAtIntegrationPoints(numberOfIntegrationPoints, localHeap);
+        FlatVector<> traceAtIntegrationPoints(numberOfIntegrationPoints, threadLocalHeap), upwindTraceAtIntegrationPoints(numberOfIntegrationPoints, threadLocalHeap);
 
         finiteElementFacet.Evaluate(facetIntegrationRule, traceCoefficients, traceAtIntegrationPoints);
 
