@@ -47,6 +47,7 @@ public:
   Convection(shared_ptr<FESpace> finiteElementSpace, shared_ptr<CoefficientFunction> aflow)
       : finiteElementSpace(dynamic_pointer_cast<L2HighOrderFESpace>(finiteElementSpace)), flowCoefficientFunction(aflow)
   {
+    cout << "mpi id: " << MyMPI_GetId() << ", number of tasks: " << MyMPI_GetNTasks() << endl;
     LocalHeap localHeap(1000000);
     shared_ptr<MeshAccess> meshAccess = this->finiteElementSpace->GetMeshAccess();
     elementsData.SetAllocSize(meshAccess->GetNE());
