@@ -8,3 +8,4 @@ add_ngsolve_python_module(liblinhyp linhypDG.cpp)
 # add_ngsolve_python_module(libequilibrate equilibrate_simple.cpp)
 
 install(TARGETS liblinhyp DESTINATION $ENV{NETGENDIR}/../lib/python3/dist-packages)
+target_compile_definitions(liblinhyp PRIVATE PARALLEL)
