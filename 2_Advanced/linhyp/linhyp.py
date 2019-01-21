@@ -2,7 +2,12 @@ from ngsolve import *
 from liblinhyp import *
 from netgen.geom2d import unit_square
 
-mesh = Mesh(unit_square.GenerateMesh(maxh=0.1))
+comm = MPI_Init()
+print("Hello from rank ", comm.rank, ' of ', comm.size)
+mesh = Mesh('unit_square.vol')
+print('rank', str(comm.rank)+"'s part of the mesh has ", mesh.ne, 'elements, ', \
+      mesh.nface, 'faces, ', mesh.nedge, 'edges and ', mesh.nv, ' vertices')
+
 fes = L2(mesh, order=5, all_dofs_together=True)
 
 gfu = GridFunction(fes)
@@ -24,16 +29,16 @@ else:
     conv += SymbolicBFI ( (-bn*IfPos(bn, u, u.Other()) * (v-v.Other())), VOL, skeleton=True)
     conv += SymbolicBFI ( (-bn*IfPos(bn, u, 0) * v), BND, skeleton=True)
 
-
 t = 0
 tau = 5e-3
-tend = 10
+tend = 1
 
 w = gfu.vec.CreateVector()
 hu = gfu.vec.CreateVector()
 
 with TaskManager():
     while t < tend:
+        print("rank:", comm.rank, ", t =", t)
         # improved Euler's method
         conv.Apply (gfu.vec, w)
         fes.SolveM (rho=1, vec=w)
@@ -44,5 +49,3 @@ with TaskManager():
         gfu.vec.data += tau * w
         t += tau
         Redraw()
-    
-
