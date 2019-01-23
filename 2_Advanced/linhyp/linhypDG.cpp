@@ -11,6 +11,7 @@
 
 #include <solve.hpp>
 #include <python_ngstd.hpp>
+#include <general/seti.hpp>
 
 using namespace ngsolve;
 using ngfem::ELEMENT_TYPE;
@@ -27,9 +28,11 @@ protected:
   public:
     size_t adjacentElementNumbers[2];
     int elementLocalFacetNumber[2];
+    int facetId;
+    Array<int> adjacentRanks;
     Vector<> InnerProductOfFlowWithNormalVectorAtIntegrationPoint;
     FacetData() = default;
-    FacetData(size_t numberOfIntegrationPoints) : InnerProductOfFlowWithNormalVectorAtIntegrationPoint(numberOfIntegrationPoints) { ; }
+    FacetData(int facetId, size_t numberOfIntegrationPoints) : facetId(facetId), InnerProductOfFlowWithNormalVectorAtIntegrationPoint(numberOfIntegrationPoints) { ; }
   };
 
   class ElementData
@@ -40,14 +43,16 @@ protected:
     ElementData(size_t ndof, size_t numberOfIntegrationPoints) : flowAtIntegrationPoint(numberOfIntegrationPoints) { ; }
   };
 
-  Array<FacetData> facetsData;     // new move semantics
-  Array<ElementData> elementsData; // new move semantics
+  Array<int> adjacentRanks;
+  Array<Array<FacetData>> sharedFacetsDataByRank;
+  Array<FacetData> boundaryFacetsData;
+  Array<FacetData> innerFacetsData;
+  Array<ElementData> elementsData;
 
 public:
   Convection(shared_ptr<FESpace> finiteElementSpace, shared_ptr<CoefficientFunction> aflow)
       : finiteElementSpace(dynamic_pointer_cast<L2HighOrderFESpace>(finiteElementSpace)), flowCoefficientFunction(aflow)
   {
-    cout << "mpi id: " << MyMPI_GetId() << ", number of tasks: " << MyMPI_GetNTasks() << endl;
     LocalHeap localHeap(1000000);
     shared_ptr<MeshAccess> meshAccess = this->finiteElementSpace->GetMeshAccess();
     elementsData.SetAllocSize(meshAccess->GetNE());
@@ -81,8 +86,7 @@ public:
     }
 
     Array<int> facetElementNumbers, facetNumbers, vertexNumbers;
-
-    facetsData.SetAllocSize(meshAccess->GetNFacets());
+    Array<FacetData> facetsData(meshAccess->GetNFacets());
 
     for (auto i : Range(meshAccess->GetNFacets()))
     {
@@ -93,7 +97,7 @@ public:
       IntegrationRule facetIntegrationRule(finiteElementFacet.ElementType(), 2 * finiteElementFacet.Order());
       const_cast<DGFiniteElement<D - 1> &>(finiteElementFacet).PrecomputeShapes(facetIntegrationRule);
 
-      FacetData facetData(facetIntegrationRule.Size());
+      FacetData facetData(i, facetIntegrationRule.Size());
 
       meshAccess->GetFacetElements(i, facetElementNumbers);
 
@@ -127,9 +131,34 @@ public:
         facetData.InnerProductOfFlowWithNormalVectorAtIntegrationPoint(j) = InnerProduct(normal, flowAtMappedElementIntegrationPoints.Row(j));
         facetData.InnerProductOfFlowWithNormalVectorAtIntegrationPoint(j) *= facetIntegrationRule[j].Weight() * mappedElementIntegrationRule[j].GetJacobiDet();
       }
+      
+      meshAccess->GetDistantProcs(NodeId(NT_EDGE, i), facetData.adjacentRanks);
 
       facetsData.Append(move(facetData));
     }
+
+    Array<FacetData> sharedFacetsData;
+    sharedFacetsData.SetAllocSize(NumberOfSharedFacets(facetsData));
+    FindSharedFacets(facetsData, sharedFacetsData);
+    adjacentRanks = FindAdjacentRanks(sharedFacetsData);
+    Array<int> numberOfSharedFacetsByRank;
+    numberOfSharedFacetsByRank.SetSize(adjacentRanks.Size());
+    for(auto i : Range(numberOfSharedFacetsByRank.Size()))
+    {
+      numberOfSharedFacetsByRank[i] = 0;
+    }
+    FindNumberOfSharedFacetsByRank(sharedFacetsData, adjacentRanks, numberOfSharedFacetsByRank);
+    sharedFacetsDataByRank.SetSize(numberOfSharedFacetsByRank.Size());
+    for(auto i: Range(numberOfSharedFacetsByRank.Size()))
+    {
+      sharedFacetsDataByRank[i] = Array<FacetData>();
+      sharedFacetsDataByRank[i].SetSize(numberOfSharedFacetsByRank[i]);
+    }
+    FindSharedFacetsByRank(sharedFacetsData, adjacentRanks, sharedFacetsDataByRank);
+    innerFacetsData.SetAllocSize(NumberOfInnerFacets(facetsData));
+    FindInnerFacets(facetsData, innerFacetsData);
+    boundaryFacetsData.SetAllocSize(NumberOfBoundaryFacets(facetsData));
+    FindBoundaryFacets(facetsData, boundaryFacetsData);
   }
 
   void Apply(BaseVector &_vecu, BaseVector &_conv)
@@ -180,96 +209,224 @@ public:
 
     static mutex add_mutex;
 
-    ParallelFor(Range(meshAccess->GetNFacets()), [&](size_t i) {
+    ParallelFor(Range(innerFacetsData.Size()), [&](size_t i) {
       LocalHeap threadLocalHeap = localHeap.Split();
+      const FacetData& facetData = innerFacetsData[i];
+      
+      // internal facet
+      const DGFiniteElement<D> &finiteElement1 =
+          static_cast<const DGFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, facetData.adjacentElementNumbers[0]), threadLocalHeap));
+      const DGFiniteElement<D> &finiteElement2 =
+          static_cast<const DGFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, facetData.adjacentElementNumbers[1]), threadLocalHeap));
+      
+      const DGFiniteElement<D - 1> &finiteElementFacet =
+          static_cast<const DGFiniteElement<D - 1> &>(this->finiteElementSpace->GetFacetFE(facetData.facetId, threadLocalHeap));
 
-      const FacetData &facetData = facetsData[i];
-      if (facetData.adjacentElementNumbers[1] != -1)
+
+      IntRange dofNumbers1 = this->finiteElementSpace->GetElementDofs(facetData.adjacentElementNumbers[0]);
+      IntRange dofNumbers2 = this->finiteElementSpace->GetElementDofs(facetData.adjacentElementNumbers[1]);
+
+
+      size_t numberOfFacetDofs = finiteElementFacet.GetNDof();
+      size_t numberOfDofsIn1 = finiteElement1.GetNDof();
+      size_t numberOfDofsIn2 = finiteElement2.GetNDof();
+
+      FlatVector<> convectionCoefficients1(numberOfDofsIn1, threadLocalHeap), convectionCoefficients2(numberOfDofsIn2, threadLocalHeap);
+      FlatVector<> traceCoefficients1(numberOfFacetDofs, threadLocalHeap), traceCoefficients2(numberOfFacetDofs, threadLocalHeap);
+
+      finiteElement1.GetTrace(facetData.elementLocalFacetNumber[0], concentration.Range(dofNumbers1), traceCoefficients1);
+      finiteElement2.GetTrace(facetData.elementLocalFacetNumber[1], concentration.Range(dofNumbers2), traceCoefficients2);
+
+      IntegrationRule facetIntegrationRule(finiteElementFacet.ElementType(), 2 * finiteElementFacet.Order());
+      size_t numberOfIntegrationPoints = facetIntegrationRule.Size();
+
+      FlatVector<> InnerProductOfFlowWithNormalVectorAtIntegrationPoint = facetData.InnerProductOfFlowWithNormalVectorAtIntegrationPoint;
+
+      FlatVector<> traceAtIntegrationPoints1(numberOfIntegrationPoints, threadLocalHeap), traceAtIntegrationPoints2(numberOfIntegrationPoints, threadLocalHeap);
+      FlatVector<> upwindTraceAtIntegrationPoints(numberOfIntegrationPoints, threadLocalHeap);
+
+      finiteElementFacet.Evaluate(facetIntegrationRule, traceCoefficients1, traceAtIntegrationPoints1);
+      finiteElementFacet.Evaluate(facetIntegrationRule, traceCoefficients2, traceAtIntegrationPoints2);
+
+      for (size_t j = 0; j < numberOfIntegrationPoints; j++)
       {
-        // internal facet
-        const DGFiniteElement<D> &finiteElement1 =
-            static_cast<const DGFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, facetData.adjacentElementNumbers[0]), threadLocalHeap));
-        const DGFiniteElement<D> &finiteElement2 =
-            static_cast<const DGFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, facetData.adjacentElementNumbers[1]), threadLocalHeap));
-        const DGFiniteElement<D - 1> &finiteElementFacet =
-            static_cast<const DGFiniteElement<D - 1> &>(this->finiteElementSpace->GetFacetFE(i, threadLocalHeap));
-
-        IntRange dofNumbers1 = this->finiteElementSpace->GetElementDofs(facetData.adjacentElementNumbers[0]);
-        IntRange dofNumbers2 = this->finiteElementSpace->GetElementDofs(facetData.adjacentElementNumbers[1]);
-
-        size_t numberOfFacetDofs = finiteElementFacet.GetNDof();
-        size_t numberOfDofsIn1 = finiteElement1.GetNDof();
-        size_t numberOfDofsIn2 = finiteElement2.GetNDof();
-
-        FlatVector<> convectionCoefficients1(numberOfDofsIn1, threadLocalHeap), convectionCoefficients2(numberOfDofsIn2, threadLocalHeap);
-        FlatVector<> traceCoefficients1(numberOfFacetDofs, threadLocalHeap), traceCoefficients2(numberOfFacetDofs, threadLocalHeap);
-
-        finiteElement1.GetTrace(facetData.elementLocalFacetNumber[0], concentration.Range(dofNumbers1), traceCoefficients1);
-        finiteElement2.GetTrace(facetData.elementLocalFacetNumber[1], concentration.Range(dofNumbers2), traceCoefficients2);
-
-        IntegrationRule facetIntegrationRule(finiteElementFacet.ElementType(), 2 * finiteElementFacet.Order());
-        size_t numberOfIntegrationPoints = facetIntegrationRule.Size();
-
-        FlatVector<> InnerProductOfFlowWithNormalVectorAtIntegrationPoint = facetData.InnerProductOfFlowWithNormalVectorAtIntegrationPoint;
-
-        FlatVector<> traceAtIntegrationPoints1(numberOfIntegrationPoints, threadLocalHeap), traceAtIntegrationPoints2(numberOfIntegrationPoints, threadLocalHeap);
-        FlatVector<> upwindTraceAtIntegrationPoints(numberOfIntegrationPoints, threadLocalHeap);
-
-        finiteElementFacet.Evaluate(facetIntegrationRule, traceCoefficients1, traceAtIntegrationPoints1);
-        finiteElementFacet.Evaluate(facetIntegrationRule, traceCoefficients2, traceAtIntegrationPoints2);
-
-        for (size_t j = 0; j < numberOfIntegrationPoints; j++)
-          upwindTraceAtIntegrationPoints(j) = InnerProductOfFlowWithNormalVectorAtIntegrationPoint(j) * ((InnerProductOfFlowWithNormalVectorAtIntegrationPoint(j) > 0) ? traceAtIntegrationPoints1(j) : traceAtIntegrationPoints2(j));
-
-        finiteElementFacet.EvaluateTrans(facetIntegrationRule, upwindTraceAtIntegrationPoints, traceCoefficients1);
-        finiteElement1.GetTraceTrans(facetData.elementLocalFacetNumber[0], traceCoefficients1, convectionCoefficients1);
-        finiteElement2.GetTraceTrans(facetData.elementLocalFacetNumber[1], traceCoefficients1, convectionCoefficients2);
-
-        {
-          lock_guard<mutex> guard(add_mutex);
-          convection.Range(dofNumbers1) -= convectionCoefficients1;
-          convection.Range(dofNumbers2) += convectionCoefficients2;
-        }
+        upwindTraceAtIntegrationPoints(j) = InnerProductOfFlowWithNormalVectorAtIntegrationPoint(j) * ((InnerProductOfFlowWithNormalVectorAtIntegrationPoint(j) > 0) ? traceAtIntegrationPoints1(j) : traceAtIntegrationPoints2(j));
       }
-      else
+
+      finiteElementFacet.EvaluateTrans(facetIntegrationRule, upwindTraceAtIntegrationPoints, traceCoefficients1);
+      finiteElement1.GetTraceTrans(facetData.elementLocalFacetNumber[0], traceCoefficients1, convectionCoefficients1);
+      finiteElement2.GetTraceTrans(facetData.elementLocalFacetNumber[1], traceCoefficients1, convectionCoefficients2);
+
       {
-        // boundary facet
-        const DGFiniteElement<D> &finiteElement =
-            dynamic_cast<const DGFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, facetData.adjacentElementNumbers[0]), threadLocalHeap));
-        const DGFiniteElement<D - 1> &finiteElementFacet =
-            dynamic_cast<const DGFiniteElement<D - 1> &>(this->finiteElementSpace->GetFacetFE(i, threadLocalHeap));
+        lock_guard<mutex> guard(add_mutex);
+        convection.Range(dofNumbers1) -= convectionCoefficients1;
+        convection.Range(dofNumbers2) += convectionCoefficients2;
+      }
+    });
 
-        IntRange dofNumbers = this->finiteElementSpace->GetElementDofs(facetData.adjacentElementNumbers[0]);
+    ParallelFor(Range(boundaryFacetsData.Size()), [&](size_t i) {
+      LocalHeap threadLocalHeap = localHeap.Split();
+      const FacetData& facetData = boundaryFacetsData[i];
+      // boundary facet
+      const DGFiniteElement<D> &finiteElement =
+          dynamic_cast<const DGFiniteElement<D> &>(this->finiteElementSpace->GetFE(ElementId(VOL, facetData.adjacentElementNumbers[0]), threadLocalHeap));
+      const DGFiniteElement<D - 1> &finiteElementFacet =
+          dynamic_cast<const DGFiniteElement<D - 1> &>(this->finiteElementSpace->GetFacetFE(facetData.facetId, threadLocalHeap));
 
-        size_t numberOfFacetDofs = finiteElementFacet.GetNDof();
-        size_t numberOfElementDofs = finiteElement.GetNDof();
+      IntRange dofNumbers = this->finiteElementSpace->GetElementDofs(facetData.adjacentElementNumbers[0]);
 
-        FlatVector<> convectionCoefficients(numberOfElementDofs, threadLocalHeap);
-        FlatVector<> traceCoefficients(numberOfFacetDofs, threadLocalHeap);
+      size_t numberOfFacetDofs = finiteElementFacet.GetNDof();
+      size_t numberOfElementDofs = finiteElement.GetNDof();
 
-        finiteElement.GetTrace(facetData.elementLocalFacetNumber[0], concentration.Range(dofNumbers), traceCoefficients);
+      FlatVector<> convectionCoefficients(numberOfElementDofs, threadLocalHeap);
+      FlatVector<> traceCoefficients(numberOfFacetDofs, threadLocalHeap);
 
-        IntegrationRule facetIntegrationRule(finiteElementFacet.ElementType(), 2 * finiteElementFacet.Order());
-        size_t numberOfIntegrationPoints = facetIntegrationRule.Size();
+      finiteElement.GetTrace(facetData.elementLocalFacetNumber[0], concentration.Range(dofNumbers), traceCoefficients);
 
-        FlatVector<> InnerProductOfFlowWithNormalVectorAtIntegrationPoint = facetData.InnerProductOfFlowWithNormalVectorAtIntegrationPoint;
-        FlatVector<> traceAtIntegrationPoints(numberOfIntegrationPoints, threadLocalHeap), upwindTraceAtIntegrationPoints(numberOfIntegrationPoints, threadLocalHeap);
+      IntegrationRule facetIntegrationRule(finiteElementFacet.ElementType(), 2 * finiteElementFacet.Order());
+      size_t numberOfIntegrationPoints = facetIntegrationRule.Size();
 
-        finiteElementFacet.Evaluate(facetIntegrationRule, traceCoefficients, traceAtIntegrationPoints);
+      FlatVector<> InnerProductOfFlowWithNormalVectorAtIntegrationPoint = facetData.InnerProductOfFlowWithNormalVectorAtIntegrationPoint;
+      FlatVector<> traceAtIntegrationPoints(numberOfIntegrationPoints, threadLocalHeap), upwindTraceAtIntegrationPoints(numberOfIntegrationPoints, threadLocalHeap);
 
-        for (size_t j = 0; j < numberOfIntegrationPoints; j++)
-          upwindTraceAtIntegrationPoints(j) = InnerProductOfFlowWithNormalVectorAtIntegrationPoint(j) * ((InnerProductOfFlowWithNormalVectorAtIntegrationPoint(j) > 0) ? traceAtIntegrationPoints(j) : 0);
+      finiteElementFacet.Evaluate(facetIntegrationRule, traceCoefficients, traceAtIntegrationPoints);
 
-        finiteElementFacet.EvaluateTrans(facetIntegrationRule, upwindTraceAtIntegrationPoints, traceCoefficients);
-        finiteElement.GetTraceTrans(facetData.elementLocalFacetNumber[0], traceCoefficients, convectionCoefficients);
+      for (size_t j = 0; j < numberOfIntegrationPoints; j++)
+        upwindTraceAtIntegrationPoints(j) = InnerProductOfFlowWithNormalVectorAtIntegrationPoint(j) * ((InnerProductOfFlowWithNormalVectorAtIntegrationPoint(j) > 0) ? traceAtIntegrationPoints(j) : 0);
 
-        {
-          lock_guard<mutex> guard(add_mutex);
-          convection.Range(dofNumbers) -= convectionCoefficients;
-        }
+      finiteElementFacet.EvaluateTrans(facetIntegrationRule, upwindTraceAtIntegrationPoints, traceCoefficients);
+      finiteElement.GetTraceTrans(facetData.elementLocalFacetNumber[0], traceCoefficients, convectionCoefficients);
+
+      {
+        lock_guard<mutex> guard(add_mutex);
+        convection.Range(dofNumbers) -= convectionCoefficients;
       }
     });
   }
+
+  private:
+
+    static bool IsInnerFacet(const FacetData& facet)
+    {
+      return facet.adjacentRanks.Size() == 0 && facet.adjacentElementNumbers[1] != -1;
+    }
+
+    static bool NumberOfInnerFacets(const Array<FacetData>& facets)
+    {
+      int numberOfInnerFacets = 0;
+      for(auto facet: facets)
+      {
+        if(IsInnerFacet(facet))
+        {
+          numberOfInnerFacets++;
+        }
+      }
+      return numberOfInnerFacets;
+    }
+
+    static void FindInnerFacets(const Array<FacetData>& facets, Array<FacetData>& innerFacets)
+    {
+      for(auto facet: facets)
+      {
+        if(IsInnerFacet(facet))
+        {
+          innerFacets.Append(move(facet));
+        }
+      }
+    }
+
+    static bool IsBoundaryFacet(const FacetData& facet)
+    {
+      return facet.adjacentRanks.Size() == 0 && facet.adjacentElementNumbers[1] == -1;
+    }
+
+    static int NumberOfBoundaryFacets(const Array<FacetData>& facets) 
+    {
+      int numberOfBoundaryFacets = 0;
+      for(auto facet: facets)
+      {
+        if(IsBoundaryFacet(facet))
+        {
+          numberOfBoundaryFacets++;
+        }
+      }
+      return numberOfBoundaryFacets;
+    }
+
+    static void FindBoundaryFacets(const Array<FacetData>& facets, Array<FacetData>& boundaryFacets)
+    {
+      for(auto facet: facets)
+      {
+        if(IsBoundaryFacet(facet))
+        {
+          boundaryFacets.Append(move(facet));
+        }
+      }
+    }
+
+    static bool IsSharedFacet(const FacetData& facet)
+    {
+      return facet.adjacentRanks.Size() > 0;
+    }
+
+    static int NumberOfSharedFacets(const Array<FacetData>& facets)
+    {
+      int numberOfSharedFacets = 0;
+      for(auto facet: facets)
+      {
+        if(IsSharedFacet(facet))
+        {
+          numberOfSharedFacets++;
+        }
+      }
+      return numberOfSharedFacets;
+    }
+
+    static void FindSharedFacets(const Array<FacetData>& facets, Array<FacetData>& sharedFacets)
+    {
+      for(auto facet : facets)
+      {
+        if(IsSharedFacet(facet))
+        {
+          sharedFacets.Append(move(facet));
+        }
+      }
+    }
+
+    Array<int> FindAdjacentRanks(const Array<FacetData>& sharedFacets)
+    {
+      netgen::IndexSet adjacentRanksSet(MyMPI_GetNTasks());
+      for(auto facet : sharedFacets)
+      {
+        adjacentRanksSet.Add(facet.adjacentRanks[0]);
+      }
+      const netgen::Array<int>& a = adjacentRanksSet.GetArray();
+      Array<int> adjacentRanks;
+      adjacentRanks.SetAllocSize(a.Size());
+      for(int i = 0; i < a.Size(); i++)
+      {
+        adjacentRanks.Append(a[i]);
+      }
+      return adjacentRanks;
+    }
+
+    void FindNumberOfSharedFacetsByRank(const Array<FacetData>& sharedFacets, const Array<int>& adjacentRanks, Array<int>& numberOfSharedFacets)
+    {
+      for(auto facetData: sharedFacets)
+      {
+        int position = adjacentRanks.Pos(facetData.adjacentRanks[0]);
+        numberOfSharedFacets[position]++;
+      }
+    }
+
+    void FindSharedFacetsByRank(const Array<FacetData>& sharedFacets, const Array<int>& adajcentRanks, Array<Array<FacetData>>& sharedFacetsByRank)
+    {
+      for(auto facetData: sharedFacets)
+      {
+        int position = adjacentRanks.Pos(facetData.adjacentRanks[0]);
+        sharedFacetsByRank[position].Append(move(facetData));
+      }
+    }
 };
 
 PYBIND11_MODULE(liblinhyp, m)
