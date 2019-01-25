@@ -3,3 +3,11 @@ CMakeFiles/
 Makefile
 CMakeCache.txt
 cmake_install.cmake
+*.out
+install_manifest.txt
+*.so
+ng.ini
+ngs.ini
+*.vol
+venv/
+.idea/
