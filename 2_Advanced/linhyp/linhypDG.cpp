@@ -306,7 +306,7 @@ private:
                         sharedFacet.adjacentElementNumbers[0],
                         sharedFacet.elementLocalFacetNumber[0],
                         threadLocalHeap);
-                data.Append(FlatVectorToFlatArray(trace));
+                data.Append(FlatVectorToFlatArray(trace, threadLocalHeap));
             }
             MPI_Request sendRequest = MyMPI_ISend(data, destination);
             sendRequests[i] = sendRequest;
@@ -463,9 +463,9 @@ private:
                         facetData.adjacentElementNumbers[0],
                         facetData.elementLocalFacetNumber[0],
                         threadLocalHeap);
-                size_t endFacetIndex = startFacetIndex + thisTraceAtIntegrationPoints.Size();
-                FlatVector<> otherTraceAtIntegrationPoints = FlatArrayToFlatVector(
-                        receivedData[receivedIndex].Range(startFacetIndex, endFacetIndex), threadLocalHeap);
+                FlatVector<> otherTraceAtIntegrationPoints(thisTraceAtIntegrationPoints.Size(), threadLocalHeap);
+                otherTraceAtIntegrationPoints = FlatArrayToFlatVector(
+                        receivedData[receivedIndex].Range(startFacetIndex, startFacetIndex + thisTraceAtIntegrationPoints.Size()), threadLocalHeap);
 
                 FlatVector<> upwindTraceAtIntegrationPoints = GetUpwindTrace(
                         thisTraceAtIntegrationPoints,
@@ -486,7 +486,7 @@ private:
                     convection.Range(dofNumbers) -= convectionCoefficients;
                 }
 
-                startFacetIndex = endFacetIndex;
+                startFacetIndex += thisTraceAtIntegrationPoints.Size();
             }
         });
     }
@@ -583,8 +583,8 @@ private:
     }
 
     template<typename T>
-    FlatArray<T> FlatVectorToFlatArray(FlatVector<T> flatVector) {
-        Array<T> array(flatVector.Size());
+    FlatArray<T> FlatVectorToFlatArray(FlatVector<T> flatVector, LocalHeap& localHeap) {
+        FlatArray<T> array(flatVector.Size(), localHeap);
         for (auto i: Range(flatVector.Size())) {
             array[i] = flatVector(i);
         }

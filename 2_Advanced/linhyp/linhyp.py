@@ -64,3 +64,5 @@ with TaskManager():
         Redraw()
 
         np.savetxt(f"data/cpp_concentration_{comm.rank}.out", gfuCpp.vec)
+
+print("finished")
