@@ -1,6 +1,3 @@
-#include <utility>
-
-
 /*
   
   Solver for the linear hyperbolic equation
